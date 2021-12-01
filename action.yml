@@ -1,0 +1,126 @@
+---
+name: docker-artifacts
+description: 'A simple docker build sequence with help and robust defaults'
+author: Daniel Barnes
+branding: 
+  icon:
+  color:
+
+outputs:
+  image-ref:
+    description: 'A unique image reference that can be used by subsequent steps'
+    value: ${{ steps.image-commit-ref.outputs.name }}
+
+inputs:
+  tags:
+    description: 'Tags for the docker build, defaults to latest, always tags with commit hash that triggered the job'
+    required: false
+    default: 'latest'
+  container-name:
+    description: 'A custom name for the container image, implied from the git repo name if not present'
+    required: false
+  registry-prefix:
+    description: 'A registry prefix for container image naming ie (docker hub username) or (gcr.io/project_id) if you intend to push a docker login step should be done first'
+    required: false
+  docker-context:
+    description: 'Docker build context (likely/default git repo root ie: ./ )'
+    required: false
+    default: ./
+  docker-file:
+    description: 'Given the context, the Dockerfile to build'
+    required: false
+    default: Dockerfile
+  docker-push:
+    description: 'Push to a docker registry (default false) determined via: <registry-prefix>/<container-name>:<tags>'
+    required: false
+    default: false
+  docker-cache-from:
+    description: 'Override the default docker build cache (GitHub Actions cache)'
+    required: false
+    default: type=gha
+  docker-cache-to:
+    description: 'Override the default docker build cache (GitHub Actions cache)'
+    required: false
+    default: type=gha,mode=max
+  artifact-name:
+    description: 'The name for the uploaded docker artifact. If not provided the container-name is the implied value'
+    required: false
+  artifact-retention:
+    description: 'The number of days for Github to store the uploaded docker image'
+    required: false
+    default: 1
+
+
+
+outputs:
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout repo
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+
+    - name: Determine container name
+      id: container-name
+      shell: bash
+      run: echo "::set-output name=name::${{ inputs.container-name || '$(basename $(git rev-parse --show-toplevel))' }}"
+
+    - name: Create full docker image name
+      id: image-name
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.registry-prefix }}" ]; then
+          echo "::set-output name=name::${{ steps.container-name.outputs.name }}"
+        else
+          echo "::set-output name=name::${{ inputs.registry-prefix }}/${{ steps.container-name.outputs.name }}"
+        fi
+
+    - name: Populate image ref
+      id: image-commit-ref
+      shell: bash
+      run: echo "::set-output name=name::${{ steps.image-name.outputs.name }}:${{ github.sha }}"
+
+    - name: Build <image-name:tag> csv
+      id: tag-csv
+      uses: actions/github-script@v5
+      env:
+        IMAGE_URI: ${{ steps.image-name.outputs.name }}
+      with:
+        result-encoding: string
+        script: |
+          var tags = function(str) {
+            const arr = str.split( ',' );
+            for (let i = 0; i < arr.length; i++) {
+              arr[i] = arr[i].trim();
+            }
+            return arr;
+          }( '${{ inputs.tags }}' )
+          tags.push(context.sha)
+          tags = tags.map((tag) => {
+            return process.env['IMAGE_URI'] + ':' + tag
+          })
+          var tagsStr = tags.join(',')
+          return tagsStr
+
+    - name: Setup docker buildx
+      uses: docker/setup-buildx-action@v1
+
+    - name: Docker build
+      uses: docker/build-push-action@v2
+      with:
+        context: ${{ inputs.docker-context }}
+        file: ${{ inputs.docker-file }}
+        push: ${{ inputs.docker-push }}
+        tags: ${{ steps.tag-csv.outputs.result }}
+        cache-from: ${{ inputs.docker-cache-from }}
+        cache-to: ${{ inputs.docker-cache-to }}
+        outputs: type=docker,dest=/tmp/${{ steps.container-name.outputs.name }}.tar
+
+    - name: Upload docker Artifact
+      uses: actions/upload-artifacts@v2
+      with:
+        name: ${{ inputs.artifact-name || steps.container-name.outputs.name }}
+        path: /tmp/${{ steps.container-name.outputs.name }}.tar
+        retention-days: ${{ inputs.artifact-retention }}
